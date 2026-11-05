@@ -21,6 +21,11 @@ problems reported with the other formats come from those libraries differing.
 - **Roblox's official Android client, which you supply.** Cordial ships no
   Roblox code, APK or assets.
 
+**On Windows:** there is no native Windows build. For development/testing,
+the Linux app can be run through WSL 2 and WSLg; see
+[`windows-wsl.md`](https://github.com/luohoa97/cordial/blob/main/docs/windows-wsl.md). This keeps the runtime and game engine in
+Linux and is not a native Windows port.
+
 ### Getting Roblox's build
 
 On first run, press **Download Roblox**. Cordial fetches the newest build from a

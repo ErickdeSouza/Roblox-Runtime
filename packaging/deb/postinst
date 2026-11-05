@@ -1,0 +1,32 @@
+#!/bin/sh
+# Said here as well as in the control file's Description, because a package
+# manager is where a false promise costs most: someone installs, launches,
+# gets a dialog they did not expect, and files a bug against a maintainer
+# rather than reading a README. The same note ships in
+# packaging/aur/cordial-git/cordial-git.install for the same reason.
+set -e
+
+case "$1" in
+    configure)
+        cat <<'MSG'
+
+Cordial ships no Roblox build. On first run it offers to fetch one, and
+installs it only if Roblox's own signing certificate signed it.
+
+Roblox publishes no Android binary of its own -- its endpoint answers
+supportsAndroidBinaries: false -- so the build comes from a third-party
+mirror, and Cordial keeps its own copy of it. If you would rather use Sober's
+build, or an APK you already have, Settings > Roblox can copy either in. Cordial
+does not follow Sober's updates after that.
+
+Start it by typing `cordial`, or from your application list. `cordial-run`
+is the loader it launches and is not what you run by hand.
+
+https://github.com/luohoa97/cordial#readme says which claims were measured
+and how.
+
+MSG
+        ;;
+esac
+
+exit 0

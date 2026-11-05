@@ -1,0 +1,107 @@
+[package]
+name = "cordial-runtime"
+description = "Loads and (eventually) runs Roblox's Android x86-64 build on Linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "cordial-run"
+path = "src/bin/load.rs"
+
+# Off by default for the same reason `cordial-shell/webview` is: it needs
+# `webkitgtk6.0-devel`, which an immutable host does not have. `webview.rs`'s
+# JSON parsing and cookie extraction are plain Rust and stay compiled either
+# way; only `cordial_shell::webview::{WindowRequest, open}` -- an actual
+# `WebKitWebView` -- sits behind this.
+[features]
+webview = ["cordial-shell/webview"]
+# Play in VR (ADR-053): `--guest-arm64`, the translator, the guest's Vulkan and
+# OpenXR bridges and the window mirror. Off by default because dynarmic needs
+# Boost's headers, and its tests an arm64-capable clang, lld and llvm, which a
+# checkout's `cargo build` should not; every package turns it on. It turns on
+# `cordial-shell/vr` as well, so the launcher offers VR only from a build
+# whose client can run it.
+vr = ["dep:cordial-guest", "cordial-guest/dynarmic", "cordial-shell/vr"]
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+# The arm64 guest: the Quest build's libroblox.so linked into this x86-64
+# process and run through dynarmic (docs/vr/dynarmic-design.md). x86-64 only
+# because dynarmic's A64 frontend has no arm64 host backend; the aarch64
+# build runs the engine natively instead. Optional: the `vr` feature above.
+cordial-guest = { path = "../cordial-guest", optional = true }
+
+[dependencies]
+cordial-linker-sys = { path = "../cordial-linker-sys" }
+cordial-plugins = { path = "../cordial-plugins" }
+# `engine::version_of`, which reads the engine's own version out of
+# `libroblox.so`. That scan lived in `load.rs`, where it was a binary's private
+# function and therefore unreachable by the updater -- which then had to report
+# that it could not tell which build was installed. One copy, in the crate that
+# needs to compare it against what Roblox has published. The dependency is new
+# only as a direct edge: this crate already pulls `cordial-update` in through
+# `cordial-shell`.
+cordial-update = { path = "../cordial-update" }
+# Only for `client_settings`'s `CORDIAL_SETTINGS_HISTORY` diagnostic: the
+# engine's own settings fetch is `.zst`-compressed
+# (`v2/settings-compressed/application/GoogleAndroidApp.zst`), and decoding a
+# copy of it needs a decoder somewhere. `cordial-plugins` already carries this
+# exact version for its own archive format, so this is not a new algorithm
+# entering the dependency tree, just a second direct edge to it.
+zstd = "0.13"
+# The window. ADR-011 makes it GTK4/libadwaita and says of the shell's window
+# and the engine's host window that they "are the same window"; the engine's
+# `wl_surface` is a subsurface of the one `cordial_shell::host_window` builds,
+# and a Wayland subsurface must share a connection — and therefore a process —
+# with its parent. ADR-002 already accepted core taking a GTK dependency; this
+# is where the runtime takes it too.
+cordial-shell = { path = "../cordial-shell" }
+# The wire between this runtime and the launcher (ADR-055): framing, typed
+# messages, the bounded event queue and the socket helper. `MIT OR Apache-2.0`,
+# and the one dependency here that is not GPL.
+cordial-protocol = { path = "../cordial-protocol" }
+# Only for `instr_close_window`, which is how the window-close shutdown path is
+# driven from a scripted run — see `wayland::instr_close_window`. The window
+# itself is `cordial-shell`'s and stays there; this is the one GTK *call* the
+# runtime makes, and it needs the trait that carries it. Same version
+# cordial-shell pins, because two versions of gtk4-rs in one process would be
+# two sets of GObject type registrations for the same C types.
+gtk4 = { version = "0.11", features = ["v4_12"] }
+# The one `adw::Window` type name this crate needs: `HostWindowCell` wraps
+# one inside `android::wayland::WaylandWindow`, and `window()` there hands it
+# back so `wire_refresh_rate` can find the output the window is actually on
+# and `cordial_runtime::webview`'s presenter can attach an opened web window
+# to it. Same version and feature `cordial-shell` pins, for the reason
+# `gtk4`'s own comment just above gives: one set of GObject type
+# registrations, not two.
+libadwaita = { version = "0.9", features = ["v1_5"] }
+ureq = "3.3.0"
+# The client-settings document is JSON and user flag overrides have to be merged
+# into it correctly. A textual splice on a 1.2 MB document is not correctness.
+serde_json = "1"
+# `localtime_r` for a recording's file name; already in the workspace through
+# `cordial-shell`, which uses it for the same reason.
+libc = "0.2"
+# Assets live in the APK, which is a zip.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# The AT-SPI bridge (android::accessibility) speaks org.a11y.atspi.* directly
+# over D-Bus — see that module's own doc comment for why a hand-rolled bridge
+# was chosen over routing through cordial-shell's GTK/libadwaita widgets.
+# Same version cordial-plugins already pins, so this adds an edge to an
+# already-resolved dependency rather than a new one to fetch.
+zbus = { version = "5.18.0", features = ["blocking"] }
+# Roblox's engine detects mimalloc at runtime and logs `[DFLog::Mimalloc]
+# Mimalloc integration detected` when it finds it; libroblox.so does not link
+# it (zero `mi_` symbols in its own undefined-symbols table), so it must be
+# offered as a discoverable library rather than a stub. Sober ships a real
+# `libmimalloc.so` beside its binary for the same reason. `extended` pulls in
+# `mi_option_get`/`mi_option_set`/`mi_version`, which is the shape the option
+# dump in the DFLog line implies the engine queries by.
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+
+[dev-dependencies]
+# The shared conformance cases, run against the real server in `control`'s tests.
+cordial-protocol = { path = "../cordial-protocol", features = ["conformance"] }

@@ -1,0 +1,1122 @@
+# Build the Flatpak and publish it as an OSTree remote on GitHub Pages, so that
+#
+#     flatpak remote-add --if-not-exists cordial \
+#         https://luohoa97.github.io/cordial/cordial.flatpakrepo
+#     flatpak install cordial io.github.luohoa97.Cordial
+#
+# installs Cordial without anyone building anything.
+#
+# This header used to be marked INFERRED, on the grounds that none of it had run
+# on a GitHub runner and that nobody had compiled Cordial inside the Flatpak SDK
+# on any machine. Both are now false, and the correction is worth more than the
+# caveat was: three consecutive green runs on 2026-08-05, and the whole workspace
+# — gtk4, gdk4, gsk4, gdk4-wayland, libadwaita and all five crates — builds
+# inside org.gnome.Sdk//50. The runner's apt package names and disk budget hold.
+#
+# What the old note claimed *had* been exercised locally is where it went wrong.
+# It said signed and unsigned `.flatpakrepo` forms were both tested and that a
+# signed definition over an unsigned repository was correctly refused. Whatever
+# was tested, it was not the unsigned form this workflow writes: it emitted
+# `GPGKey=` with an empty value, which flatpak 1.18.0 refuses outright with
+# `error: Invalid gpg key`. That was only discovered once a run went green and
+# the generated file existed to be added at all.
+#
+# Verified against the deployed remote, not a stand-in: `remote-add` accepted,
+# `remote-ls` returning app/io.github.luohoa97.Cordial/x86_64/master, and
+# `install` placing both cordial-shell and cordial-run in /app/bin.
+#
+# The site and the repository share one Pages deployment:
+#
+#     /                      site/ — the project's web page
+#     /cordial.flatpakrepo   the remote definition
+#     /repo/                 the OSTree repository
+#
+# A browser hitting the root has to get a web page, which is why the repository
+# is under /repo/ rather than at the root.
+#
+# Nothing deploys until the repository variable PUBLISH_PAGES is set to "true"
+# and Pages is switched to "GitHub Actions" in the repository settings. Until
+# then this builds and uploads an artifact and stops, which is deliberate: a
+# workflow that starts publishing a public remote the moment it lands is not a
+# thing to spring on anyone.
+#
+# Two branches live in that repository, not one:
+#
+#     master   every push to main, exactly as before -- the edge channel
+#     stable   only the commit that carries a v* release tag -- the release channel
+#
+# and a plain `flatpak install cordial io.github.luohoa97.Cordial`, with no
+# branch named, now lands on stable rather than master, because "Update the
+# repository summary" below sets xa.default-branch once stable exists. This
+# is why the bug report that started this ("an installed release keeps
+# following main") had a real fix: master was the only branch and the only
+# default there was ever going to be. Existing master-tracking installs are
+# untouched by any of this -- a remote's default branch only matters to an
+# install naming none -- and are told how to move onto stable in the README
+# and in packaging/cordial.flatpakrepo's own comment.
+#
+# The one part of this worth writing down at length: **GitHub Pages has no
+# incremental publish, so `stable` has to be re-supplied by every deployment,
+# and whichever deployment finishes last is the site.** `build` hands
+# flatpak-builder a repository that starts empty and only ever exports
+# `master`; nothing carries `stable` from one run to the next except the
+# `merge` job copying it out of the live site before it uploads the new one.
+#
+# That copy used to happen in `build`, at the start of a run, together with the
+# question "does this commit carry a release tag?", and both were answered too
+# early. On 2026-10-15, for 0.28.0: the run for the release commit asked about
+# the tag in its first minute, before the tag existed, and published no stable;
+# a rerun fixed that and deployed stable=0.28.0 at 06:23:12; and the run for
+# the next commit, started at 06:08, had pulled the then-live stable (0.27.0)
+# when it began and deployed it at 06:23:41, thirty seconds later. Stable went
+# back a release with every job green.
+#
+# The rule now: **stable is decided in `merge`, after every build has
+# finished, from the live site as it is at that moment, by
+# packaging/flatpak-stable.sh, and `merge` holds the `flatpak-pages`
+# concurrency group from that read until `deploy-pages` returns.** That makes
+# the read-then-publish sequence one critical section, so a later deployment
+# starts from what the earlier one published, and the script refuses to move
+# stable to a lower version than the live one in any case. The tag question is
+# asked in the same job, against the remote, minutes after the push. The
+# script's own header says what it does for a tagged and an untagged commit.
+#
+# What this does not cover: GitHub keeps one pending run per concurrency
+# group and cancels the rest, so a tagged main run that is still queued when
+# two more pushes arrive is dropped, and the next run carries the old stable
+# forward. The script warns when the newest tag below the commit is ahead of
+# the stable it publishes, so that case is visible rather than silent; the
+# remedy is `gh run rerun` on the dropped run.
+
+name: Flatpak
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'packaging/**'
+      - '.github/workflows/flatpak.yml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+# `actions: read` is for "Fetch the apt repository" in the build job below,
+# which reads apt.yml's artifacts from a *different* workflow run than this
+# one -- ordinary same-run artifact access does not need it.
+#
+# `contents: write` used to live here too, for an "Attach the bundle to the
+# release" step that ran inline in the build job. That step is now the
+# `publish` job below, calling the shared attach-to-release.yml -- see
+# release.yml for the drift that made sharing it worth doing -- and a
+# reusable workflow does not inherit permissions from the workflow around it,
+# so the calling job has to grant them itself. `publish` carries its own
+# `contents: write` / `id-token: write` for exactly that reason, rather than
+# this block growing to cover a job that, past that one step, never wrote
+# anything.
+#
+# **`contents: read` stays, and dropping it broke everything for a moment.**
+# Declaring this block at all sets every scope not listed to `none`, not to the
+# repository default -- so trimming it to `actions: read` alone left `build`
+# with `contents: none`, and its very first step is `actions/checkout`, which
+# authenticates with the job token and is refused rather than falling back to
+# anonymous access. That is every trigger of this workflow, not the release path
+# the change was about: main, every pull request, every tag. The reasoning that
+# removed it was about `write` and never asked what else the same scope gated.
+permissions:
+  contents: read
+  actions: read
+
+# **The `flatpak-pages` concurrency group used to live here, at workflow level,
+# and that was the bug that shipped two releases with no Flatpak attached.**
+# It is now on the `merge` job alone, which deploys. What follows is why, because the comment
+# it replaces argued the opposite and argued it from a real observation.
+#
+# The original reasoning: two runs exporting into the same Pages deployment
+# would race, and cancelling a half-finished OSTree export is worse than
+# queueing. That is still true of the deployment. It was never true of the
+# build, and covering the whole workflow to protect the deploy is what did the
+# damage.
+#
+# The old comment noted, on 2026-08-05, that "a tag pushed alongside `main`
+# lands in this same group and is usually the one dropped, so `v0.5.1` has no
+# build of its own", and dismissed it: "Same content, built by `main`; only the
+# attribution differs." **That dismissal is wrong, and it is wrong because of a
+# change made in this same file.** The bundle is attached to the GitHub release
+# by the `publish` job, which is tag-only -- a `main` run never attaches
+# anything. So a dropped tag run does not merely lose attribution, it loses the
+# release asset, silently, with every job reporting success.
+#
+# Measured, not reasoned: v0.12.0 published with zero assets. v0.12.1's tag run
+# 33289851652 (sha 26d151c) sat pending in this group and was cancelled when a
+# push to `main` created a newer run; 33289817321 went the same way earlier the
+# same day. `cancel-in-progress: false` does not prevent this -- GitHub keeps
+# exactly one *pending* run per group and displaces it when a newer one joins,
+# so "do not cancel" only protects a run that already started.
+#
+# Why the build is safe unserialised: each run exports into `--repo=repo`, a
+# fresh directory in its own workspace, and never fetches the published tree.
+# Two builds share no state. The `publish` job attaches to the release named by
+# its own tag, so two of those cannot collide either. The deployment, and the
+# read of the live site that precedes it, are the only shared resources in the
+# file, and they are the only thing queued on.
+#
+# `timeout-minutes: 45` on the build job stays, but it is no longer load-bearing
+# for the queue: a stuck build cannot hold a group it is not in.
+
+# **Matrixed over x86_64 and aarch64 since 2026-09-23, and this is the one part
+# of that change genuinely unverified end to end.** flatpak-builder builds for
+# whatever architecture the machine running it is, so pointing `build` at
+# GitHub's free `ubuntu-24.04-arm` runner as well as `ubuntu-latest` produces
+# an aarch64 export with no change to the recipe itself -- `uname -m` inside
+# the container already returns `aarch64`, which is also exactly how OSTree
+# and Flatpak spell the architecture in a ref (`app/$APP_ID/aarch64/master`),
+# so that single value is read once per job and used everywhere below instead
+# of a second matrix axis that could drift from it.
+#
+# What is genuinely new, rather than a mechanical find-and-replace of the
+# literal `x86_64`, is that each matrix leg now produces its *own* local
+# `repo/` -- flatpak-builder starts from empty every run, and the two legs run
+# on two different machines with no shared filesystem -- and both have to end
+# up served from the one OSTree tree this workflow publishes to Pages.
+# Flatpak's own ref scheme (`app/$ID/$ARCH/$BRANCH`) is designed for exactly
+# this: Flathub itself serves many architectures out of one repository, with
+# no collision, because the architecture is part of the ref rather than a
+# property of the repository as a whole. So a single shared repo correctly
+# holding both architectures' refs is Flatpak's ordinary case, not a stretch.
+#
+# What is untested here is the *mechanics* of getting there from two separate
+# local repos built on two separate runners: the `merge` job below combines
+# them with `ostree pull-local`, once each, into a third repo that is what
+# actually gets published. `ostree pull-local` copying refs and objects
+# between two local repos with disjoint history (they share no common parent
+# commit -- each leg's `master` and `stable` are their own architecture's
+# lineage, not two branches of the same one) is standard OSTree usage and
+# not, so far as this comment's author could establish, something that needs
+# a shared ancestor to work. It has not been run against a real
+# flatpak-builder export of this workspace, on either architecture, because
+# authoring this change did not include running it. Treat the `merge` job as
+# INFERRED until somebody watches it produce a Pages tree that both an x86_64
+# and an aarch64 `flatpak install` succeed against.
+#
+# The published URL lives in packaging/cordial.flatpakrepo and is deliberately
+# not derived from github.repository here: the Url a user's flatpak remembers
+# must not change under them because the repository was renamed or forked.
+env:
+  APP_ID: io.github.luohoa97.Cordial
+  MANIFEST: packaging/io.github.luohoa97.Cordial.yml
+  # Must name the same tree as Url in packaging/cordial.flatpakrepo -- see
+  # that file's own comment for why it is not derived from github.repository.
+  # packaging/flatpak-stable.sh reads this exact repository back during the
+  # `merge` job, so a rename here with no matching rename there would make
+  # that step silently pull from the wrong tree, or from nothing, rather than
+  # fail loudly.
+  PAGES_REPO_URL: https://luohoa97.github.io/cordial/repo/
+  # See release.yml. The Flatpak build cannot see this variable (flatpak-builder
+  # gives its build a clean environment; INFERRED, not run), so "Stamp the
+  # build" below also writes it to a file build.rs reads.
+  CORDIAL_OFFICIAL_BUILD: ${{ github.repository }}
+
+jobs:
+  build:
+    name: build (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # A ceiling, because there is a queue behind this.
+    #
+    # GitHub's default is six hours, and a build that never finishes keeps
+    # its own `merge`, and the deploy, waiting. That is not hypothetical: a run
+    # hung in `apt-get` on `Install flatpak` for twenty-eight minutes and had to
+    # be cancelled by hand, by which time two queued runs had been superseded and
+    # dropped. Six hours of that would have looked exactly like CI being broken.
+    #
+    # Green runs here take seven to eleven minutes, so this is generous rather
+    # than tight; anything past it is stuck rather than slow, and a failed run
+    # publishes nothing while a hung one blocks everything.
+    timeout-minutes: 45
+    steps:
+      # No submodules. The manifest pins third_party/libjnivm,
+      # third_party/mcpelauncher-linker and third_party/dynarmic as `git`
+      # sources by commit and skips them out of the `dir` source, so a recursive checkout would only be
+      # copied in and then thrown away.
+      #
+      # fetch-tags is kept as it was, but it no longer serves the release
+      # decision: this job used to ask `git tag --points-at HEAD` whether the
+      # commit was tagged, and that was the first half of the 2026-10-15 stable
+      # race (see the header), because the tag did not exist yet when a
+      # branch-push run reached it. `merge` asks the remote instead, late.
+      # What may still read the tags is crates/cordial-shell/build.rs, whose
+      # `git describe --tags --exact-match` decides whether a release build
+      # shows its commit; whether that runs inside the sandboxed build at all
+      # is INFERRED, so the setting stays.
+      #
+      # **Except on a tag push, where fetch-tags breaks the checkout itself**:
+      # v0.18.0's tag run failed both builds with "Cannot fetch both <sha> and
+      # refs/tags/v0.18.0 to refs/tags/v0.18.0", because checkout already
+      # fetches the triggering tag and fetch-tags asks for it a second time.
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-tags: ${{ github.ref_type != 'tag' }}
+
+      # The one value every arch-specific literal in this file now reads
+      # instead of spelling `x86_64` out -- see the header comment for why
+      # `uname -m` is the whole of what is needed rather than a second matrix
+      # axis. Set once, early, into GITHUB_ENV so every later step in this
+      # job -- not just `run:` steps, `with:`/`if:` expressions too -- sees
+      # `$ARCH` / `${{ env.ARCH }}` without re-deriving it.
+      - name: Read this runner's architecture the way OSTree spells it
+        run: echo "ARCH=$(uname -m)" >> "$GITHUB_ENV"
+
+      # The runner ships with about 25 GB free and a lot of it is Android SDKs
+      # and dotnet nobody here needs. The Flatpak build carries the runtime, the
+      # SDK, two SDK extensions, a full cargo target directory and an OSTree
+      # repository at once. INFERRED that this is necessary — if the build has
+      # room to spare, delete this step rather than leaving a cargo-cult in it.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      # From the Flatpak project's own PPA, not Ubuntu's archive. The manifest
+      # grants `--device=input`, which `flatpak build-finish` only accepts from
+      # 1.15.6, and Ubuntu 24.04 ships 1.14.6: with the archive's package the
+      # build would stop at "Unknown device type input" (INFERRED from
+      # flatpak-context.c at 1.14.10; the PPA publishes 1.18.4 for noble, which
+      # was read from Launchpad, not run here). The guard turns a silent
+      # fallback to an old package into a legible failure.
+      - name: Install flatpak
+        run: |
+          sudo add-apt-repository -y ppa:flatpak/stable
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder ostree
+          flatpak --version
+          flatpak-builder --version
+          have=$(flatpak --version | awk '{print $2}')
+          if [ "$(printf '%s\n1.15.6\n' "$have" | sort -V | head -n1)" != 1.15.6 ]; then
+            echo "::error::flatpak $have cannot build a manifest with --device=input (needs 1.15.6)"
+            exit 1
+          fi
+
+      # Read from the manifest rather than repeated here, so bumping the
+      # runtime is a one-line change in one file.
+      #
+      # Two versions, not one. The GNOME runtime carries GTK4 and libadwaita and
+      # is numbered 50; the freedesktop SDK extensions it inherits are numbered
+      # by the base runtime, 25.08. This step used to derive all four from
+      # `runtime-version`, which asked Flathub for a rust-stable//50 that does
+      # not exist — though it never got that far, because the build itself was
+      # failing earlier on a runtime with no gtk4 in it.
+      - name: Install the runtimes the manifest names
+        run: |
+          set -euo pipefail
+          v=$(sed -n "s/^runtime-version: *'\(.*\)'/\1/p" "$MANIFEST")
+          e=$(sed -n "s/^# sdk-extension-version: *'\(.*\)'/\1/p" "$MANIFEST")
+          if [ -z "$v" ] || [ -z "$e" ]; then
+            echo "::error::could not read runtime-version / sdk-extension-version from $MANIFEST"
+            exit 1
+          fi
+          echo "runtime version: $v; sdk extension version: $e"
+          flatpak remote-add --user --if-not-exists flathub \
+              https://dl.flathub.org/repo/flathub.flatpakrepo
+          # rust-stable is pinned to a commit, and llvm20 is not, because
+          # Flathub's current rust-stable is broken on their side.
+          #
+          # Published 2026-08-21 02:28 UTC, commit 4d0c0a79, and it 404s on one
+          # of its own objects:
+          #
+          #   While fetching https://dl.flathub.org/repo/objects/06/
+          #   0fdf65e0a1042c0db51bf9d009048f9f07e047b422e0e736c5d8ad35ac3a9c.filez
+          #   Server returned HTTP 404
+          #
+          # Reproduced off CI on a developer machine, so it is not the runner,
+          # not the region and not this workflow. Two theories were tried and
+          # both were wrong: the ref is present (`remote-info` answers, but
+          # that reads summary metadata and never touches the objects, so it
+          # was the wrong check), and `--no-static-deltas` made no difference
+          # across three attempts.
+          #
+          # 385427f6 is the commit before it, from 2026-08-12, and it pulls
+          # cleanly -- 325 MB, verified by hand. `flatpak install --commit` does
+          # not exist and `flatpak update --commit` needs the ref installed
+          # already, which is the thing that fails, so the pin goes through
+          # ostree into flatpak's own repo and the install then runs offline.
+          #
+          # **Remove this the moment Flathub republishes.** Pinning a toolchain
+          # to a three-week-old commit is a thing that quietly rots; the check
+          # is whether the plain install below the pin succeeds on its own.
+          flatpak install --user --noninteractive flathub \
+              "org.gnome.Platform//$v" \
+              "org.gnome.Sdk//$v" \
+              "org.freedesktop.Sdk.Extension.llvm20//$e"
+
+          rust_ref="runtime/org.freedesktop.Sdk.Extension.rust-stable/$ARCH/$e"
+          # **This pinned commit is x86_64-specific, and that is now worth
+          # saying explicitly.** It was hashed against the x86_64 build of
+          # this extension on 2026-08-12; OSTree commits are per-architecture
+          # objects even though the hash carries no arch in its text, so this
+          # exact hash does not exist in the aarch64 leg's own commit lineage
+          # and pulling it there would 404 the same way the broken *current*
+          # commit does, for an unrelated reason. Rather than guess an
+          # aarch64 commit that was never measured, the fallback below is
+          # gated on $ARCH: on x86_64 it behaves exactly as before, and on
+          # aarch64 a broken plain install fails loudly instead of silently
+          # trying a pin that cannot be right.
+          if flatpak install --user --noninteractive flathub \
+                 "org.freedesktop.Sdk.Extension.rust-stable//$e"; then
+              echo "rust-stable installed normally; the pin below is no longer needed"
+          elif [ "$ARCH" = "x86_64" ]; then
+              rust_pin="385427f6dabe6d297cced114496cfa6e38bb93fe4c6fbee7fdabb97dd141d29a"
+              echo "::warning::rust-stable//$e will not pull from Flathub; falling back to pinned commit $rust_pin"
+              ostree --repo="$HOME/.local/share/flatpak/repo" pull flathub "${rust_ref}@${rust_pin}"
+              flatpak install --user --noninteractive --no-pull flathub \
+                  "org.freedesktop.Sdk.Extension.rust-stable//$e"
+          else
+              echo "::error::rust-stable//$e will not pull from Flathub on $ARCH, and there is no pinned aarch64 commit to fall back to (see the comment above)." >&2
+              exit 1
+          fi
+
+      # The build step has no network (issue #3), so every crate arrives through
+      # packaging/cargo-sources.json and is fetched in flatpak-builder's download
+      # phase. That list is generated from Cargo.lock and is the only thing
+      # standing between a dependency bump and a build failure nobody can read,
+      # so check it here rather than fifteen minutes later inside the sandbox.
+      #
+      # The generator is stdlib-only and deterministic: same lock file, same
+      # bytes out. A diff means somebody changed Cargo.lock without rerunning it.
+      - name: The vendored crate list matches Cargo.lock
+        run: |
+          set -euo pipefail
+          python3 packaging/cargo-sources.py
+          git diff --exit-code -- packaging/cargo-sources.json || {
+            echo "::error::packaging/cargo-sources.json is stale. Run"
+            echo "::error::  python3 packaging/cargo-sources.py"
+            echo "::error::and commit the result alongside Cargo.lock."
+            exit 1
+          }
+
+      # Crate downloads and the two pinned git clones, which are the same on
+      # every run until Cargo.lock or the manifest changes. Not the built
+      # objects — restoring a stale build cache is how a package ends up
+      # shipping a binary nobody can account for.
+      - name: Cache downloaded sources
+        uses: actions/cache@v4
+        with:
+          path: .flatpak-builder/downloads
+          key: flatpak-downloads-${{ hashFiles('Cargo.lock', 'packaging/io.github.luohoa97.Cordial.yml', 'packaging/cargo-sources.json') }}
+          restore-keys: flatpak-downloads-
+
+      # Absent secret means an unsigned repository, and the README says so in
+      # those words. It does not mean a quietly unsigned one.
+      - name: Import the signing key
+        id: gpg
+        env:
+          KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          KEYID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEY:-}" ]; then
+            echo "no FLATPAK_GPG_PRIVATE_KEY secret; the repository will be unsigned"
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          home="$RUNNER_TEMP/gnupg"
+          mkdir -p "$home"
+          chmod 700 "$home"
+          printf '%s' "$KEY" | gpg --homedir "$home" --batch --import
+          if [ -z "${KEYID:-}" ]; then
+            echo "FLATPAK_GPG_PRIVATE_KEY is set but FLATPAK_GPG_KEY_ID is not" >&2
+            exit 1
+          fi
+          echo "signing=true" >> "$GITHUB_OUTPUT"
+          echo "gpghome=$home" >> "$GITHUB_OUTPUT"
+
+      - name: Stamp the build with the repository that built it
+        run: printf '%s' "$CORDIAL_OFFICIAL_BUILD" > .cordial-official-build
+
+      - name: Build and export
+        run: |
+          set -euo pipefail
+          args=(--force-clean --user --disable-rofiles-fuse --repo=repo)
+          if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
+            args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
+                   --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
+          fi
+          flatpak-builder "${args[@]}" build "$MANIFEST"
+
+      # `[profile.release] debug = true`, deliberately — the runtime is useless
+      # to debug without symbols. Measured on a local build: cordial-run is
+      # 178 MB unstripped against 9.5 MB stripped, cordial-shell 161 MB against
+      # 5.2 MB. flatpak-builder splits that into a .Debug extension, and
+      # publishing it would put roughly 325 MB of symbols into a Pages site with
+      # a 1 GB limit and a 100 MB per-file limit, to be downloaded by every user
+      # who never asked for them. The symbols stay in the build artefacts and in
+      # a local `packaging/build-flatpak.sh`; they do not go on the remote.
+      - name: Drop the debug extension from the published repository
+        run: |
+          set -euo pipefail
+          ostree --repo=repo refs
+          ostree --repo=repo refs --delete "runtime/$APP_ID.Debug/$ARCH/master" || true
+
+      # Run here, per architecture, on this leg's own single-arch `repo` --
+      # not only in `merge` below -- because the single-file bundle two steps
+      # from now is built from this local repo before the merge job ever
+      # sees it, and a summary is what lets that repo's own appstream branch
+      # exist for the bundle to carry. `merge` regenerates the summary again
+      # afterwards, over the combined tree, which is the one that actually
+      # gets published; this run is for the bundle's benefit and is not
+      # wasted even though its output here is never itself served.
+      - name: Update the repository summary and appstream branch
+        run: |
+          set -euo pipefail
+          args=(--prune)
+          if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
+            args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
+                   --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
+          fi
+          # Without --prune and the summary rewrite the repository has objects
+          # and no summary, and `flatpak install` answers "No remote refs
+          # found" — which reads like a bad URL and is not one. Static deltas
+          # are deliberately not generated: they make installs much faster and
+          # the repository much bigger, and size is the binding constraint on
+          # Pages.
+          flatpak build-update-repo "${args[@]}" repo
+          ostree --repo=repo refs
+
+      # **A release with nothing to download sends everybody through the
+      # unsigned remote**, which is the one step in the install this repository
+      # spends four paragraphs warning people about. A single-file bundle is the
+      # install with no trust decision in it:
+      #
+      #     flatpak install --user ./Cordial-<tag>.flatpak
+      #
+      # Built from the same `repo` the remote is published from, after the debug
+      # extension has been dropped, so it is byte-for-byte the thing a remote
+      # install would have fetched -- not a second build that might differ.
+      - name: Build a single-file bundle
+        run: |
+          set -euo pipefail
+          ref="${GITHUB_REF_NAME:-main}"
+          # Pull-request refs such as 49/merge must not become directories.
+          ref="${ref//\//-}"
+          # Arch-suffixed since this leg is one of two now: without it the
+          # x86_64 and aarch64 legs would both write "Cordial-${ref}.flatpak"
+          # and the second upload-artifact call below would collide with the
+          # first.
+          out="Cordial-${ref}-${ARCH}.flatpak"
+          # --arch named explicitly rather than left to build-bundle's own
+          # default (the host's `uname -m`, which happens to already be
+          # right here) -- this step runs on the same architecture it is
+          # bundling for by construction, but naming it removes the "happens
+          # to be" from that sentence.
+          flatpak build-bundle repo "$out" "$APP_ID" master \
+            --arch="$ARCH" \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
+          ls -lh "$out"
+          echo "BUNDLE=$out" >> "$GITHUB_ENV"
+
+      # Kept for every build, tag or not: a pull request that changes packaging
+      # is exactly when somebody wants to install the result and try it, and
+      # asking them to build it themselves is how packaging regressions reach a
+      # release.
+      - name: Upload the bundle as a workflow artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cordial-flatpak-bundle-${{ env.ARCH }}
+          path: ${{ env.BUNDLE }}
+          if-no-files-found: error
+
+      # This leg's own local repo, handed to the `merge` job below so both
+      # architectures' refs end up in the one tree that actually gets
+      # published -- see the header comment for why a single shared repo can
+      # hold both without collision, and what about the merge itself is not
+      # yet verified. Not the same thing as the bundle just uploaded: the
+      # bundle is one ref packaged standalone, this is the whole local OSTree
+      # repository this leg built, objects and refs together.
+      - name: Upload this leg's OSTree repo, for the merge job to combine
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-repo-${{ env.ARCH }}
+          path: repo
+          if-no-files-found: error
+          # A build tree, not a release artefact -- nobody downloads this by
+          # hand, and it is only ever consumed by the very next job in this
+          # same run. The default 90 days would just be spending storage on
+          # every push for no reader.
+          retention-days: 1
+
+      # Attaching this to the release, on a tag, and signing it, is the
+      # `publish` job below -- not a step here. It used to be a bare
+      # `gh release upload` in this job with no create-if-missing and no
+      # signing, which is the drift release.yml's own header now warns about:
+      # a tag where this build finished first failed release.yml's way of
+      # doing it before that job grew a create-if-missing check, and this was
+      # the one artefact that never got signed. Splitting it into a separate
+      # job also means it is not gated on the disk-heavy Pages assembly,
+      # which now lives in the `merge` job below and which this bundle has
+      # nothing to do with.
+
+  merge:
+    name: Merge both architectures' repos and assemble the Pages tree
+    # Runs once, not matrixed -- combining two already-built repos is
+    # architecture-agnostic work (ostree deals in content-addressed objects,
+    # not in code it executes), so there is no reason to pay for an arm64
+    # runner here, or to do this twice.
+    needs: build
+    runs-on: ubuntu-latest
+    # Includes the wait for the Pages deployment now, which is a few minutes.
+    timeout-minutes: 40
+    # **This job both decides `stable` and deploys, and holds this group for
+    # both.** They were two jobs (`merge`, then `deploy`, with the group on
+    # `deploy` alone), and that is what let run B's `merge` read the live
+    # channel while run A's `deploy` was still pending: a group serialises
+    # jobs, not the gap between two of them. A job holds a group only while
+    # it runs, so the read of the live site and the publish that replaces it
+    # have to be steps of the same job. Pull requests and manual runs off
+    # main get a group of their own and never queue behind a deploy; they do
+    # not deploy.
+    #
+    # Queued, not cancelled in progress: cancelling a half-finished deploy is
+    # worse than waiting. A *pending* run displaced by a newer push is
+    # cancelled by GitHub regardless, which is fine for a tree (the newer one
+    # is the one anyone wants) and is the one hole for a release; the header
+    # comment says what the script does about it.
+    concurrency:
+      group: ${{ github.ref == 'refs/heads/main' && 'flatpak-pages' || format('flatpak-merge-{0}', github.run_id) }}
+      cancel-in-progress: false
+    # Only a deploying run enters the environment: its deployment branch
+    # policy names `main` and nothing else, so a pull request or a branch run
+    # that named it would be refused. An empty name is no environment.
+    # INFERRED: that an empty expression is accepted here, and `url:` with
+    # it, was not documented anywhere that was read; the dispatch run from a
+    # branch is what shows it (see the commit).
+    environment:
+      name: ${{ (github.ref == 'refs/heads/main' && vars.PUBLISH_PAGES == 'true') && 'github-pages' || '' }}
+      url: ${{ steps.deployment.outputs.page_url }}
+    # A job-level block replaces the workflow's, so the two it needs from
+    # there are repeated: contents for checkout, actions for the apt, dnf and
+    # pacman artefacts of other workflows' runs.
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+    steps:
+      # Only for the files "Assemble the Pages tree" below reads: the site,
+      # the icons, and the two static repo-definition files. Same reasoning
+      # as attach-to-release.yml's own sparse checkout.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+          sparse-checkout: |
+            site
+            packaging/icons
+            packaging/banner.svg
+            packaging/cordial.repo
+            packaging/cordial.flatpakrepo
+            packaging/flatpak-stable.sh
+          sparse-checkout-cone-mode: false
+
+      - name: Install ostree and flatpak
+        # Not flatpak-builder: nothing here builds anything, it only combines
+        # two already-exported repos and re-runs the summary generation
+        # `flatpak build-update-repo` (the `flatpak` package's own command,
+        # not flatpak-builder's) already ran once per leg in `build` above.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak ostree
+
+      # Same step as in `build`, duplicated rather than shared, because a
+      # reusable-workflow extraction for one nine-line step would be more
+      # machinery than the step itself -- apt.yml, yum.yml and pacman.yml
+      # already each carry their own copy of this same shape for the same
+      # reason. Needed again here because the summary this job regenerates
+      # over the merged tree has to be signed the same way each leg's own
+      # per-arch summary already was.
+      - name: Import the signing key
+        id: gpg
+        env:
+          KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          KEYID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEY:-}" ]; then
+            echo "no FLATPAK_GPG_PRIVATE_KEY secret; the repository will be unsigned"
+            echo "signing=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          home="$RUNNER_TEMP/gnupg"
+          mkdir -p "$home"
+          chmod 700 "$home"
+          printf '%s' "$KEY" | gpg --homedir "$home" --batch --import
+          if [ -z "${KEYID:-}" ]; then
+            echo "FLATPAK_GPG_PRIVATE_KEY is set but FLATPAK_GPG_KEY_ID is not" >&2
+            exit 1
+          fi
+          echo "signing=true" >> "$GITHUB_OUTPUT"
+          echo "gpghome=$home" >> "$GITHUB_OUTPUT"
+
+      # One subdirectory per architecture (download-artifact's default
+      # behaviour for a multi-artifact `pattern` fetch with no
+      # merge-multiple) rather than flattened into one directory: unlike
+      # apt's or dnf's per-arch *files*, these are two whole OSTree
+      # repositories and have to stay two separate `--repo=` arguments for
+      # `ostree pull-local` below, not one merged directory tree.
+      - name: Download both architectures' repos
+        uses: actions/download-artifact@v4
+        with:
+          pattern: flatpak-repo-*
+          path: legs
+
+      # **The step this whole job exists for, and the one part of this
+      # change that is INFERRED rather than verified -- see the header
+      # comment.** `ostree pull-local` copies refs and their objects from one
+      # local repository into another; run once per leg, it leaves `merged`
+      # holding both architectures' `master` and `stable` refs side by side,
+      # each under its own `app/$APP_ID/<arch>/<branch>` name, which is
+      # exactly the namespacing Flatpak's own ref scheme is for. `init` first
+      # because `pull-local` pulls *into* an existing repository rather than
+      # creating one; `--mode=archive-z2` to match what flatpak-builder's own
+      # `--repo=repo` export already produced in each leg (a bare or
+      # mismatched-mode destination is a real way for a local OSTree pull to
+      # refuse, so this is not a formality).
+      - name: Combine both architectures' repos into one
+        # **Failed here on the first real run, and this is the fix, not a
+        # guess: reproduced locally first.** `ostree pull-local SRC` with no
+        # explicit refs enumerates `SRC/refs/remotes` to decide what to pull,
+        # and `actions/upload-artifact`/`download-artifact` do not preserve
+        # empty directories -- `refs/remotes` and `refs/mirrors` are always
+        # empty in a repo `flatpak-builder` exports (nothing here ever adds a
+        # remote to it), so the round trip through the artifact silently drops
+        # them, and pull-local dies with "opendir(refs/remotes): No such file
+        # or directory". Verified against a real ostree repo on this host:
+        # removing those two directories reproduces the exact error, and
+        # recreating them before pull-local (`mkdir -p`, a no-op if they do
+        # exist) resolves it cleanly.
+        run: |
+          set -euo pipefail
+          ostree --repo=merged init --mode=archive-z2
+          for arch_dir in legs/flatpak-repo-*; do
+            mkdir -p "$arch_dir/refs/remotes" "$arch_dir/refs/mirrors"
+            echo "==> pulling $arch_dir into the merged repo"
+            # Named refs only. Enumerating also finds the remote-tracking
+            # `pages-live:app/.../stable` the stable carry-forward leaves
+            # behind, which pull-local rejects as "Invalid ref name": every
+            # untagged run failed that way once a stable ref existed on the
+            # live site. Reproduced locally with a throwaway repository.
+            mapfile -t leg_refs < <(ostree --repo="$arch_dir" refs | grep -v ':')
+            ostree --repo=merged pull-local "$arch_dir" "${leg_refs[@]}"
+          done
+          echo "==> refs in the merged repo:"
+          ostree --repo=merged refs
+
+      # Asked here, against the remote, because the answer has to be read
+      # after the tag exists and the release choreography pushes `main` and
+      # the tag together (`git push origin main <tag>`): a run started by the
+      # branch push can be minutes ahead of the tag ref, and the build job
+      # used to ask in its first minute. By now every build has finished.
+      # Only `main` can publish, so only `main` asks; elsewhere the answer is
+      # empty and the script below is a read-only rehearsal.
+      #
+      # `ls-remote` rather than a fetch: a tag object is annotated or not
+      # depending on how it was made, and `^{}` lines carry the commit either
+      # way. Two tags on one commit are possible; the highest wins.
+      #
+      # `newest` is only for the warning: the newest tag that is an ancestor of
+      # this commit, by the compare API (`ahead` or `identical` means the tag
+      # is behind or at this commit), looking at the five highest tags.
+      - name: Work out which release tag this commit carries
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          lines=$(git ls-remote --tags "https://github.com/$GITHUB_REPOSITORY.git" 'refs/tags/v*')
+          names=$(awk '{sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $1, $2}' <<<"$lines")
+          tag=""
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            tag=$(awk -v sha="$GITHUB_SHA" '$1 == sha {print $2}' <<<"$names" | sort -Vu | tail -n 1)
+          fi
+          newest=""
+          while read -r t; do
+            [ -n "$t" ] || continue
+            st=$(gh api "repos/$GITHUB_REPOSITORY/compare/$t...$GITHUB_SHA" --jq .status 2>/dev/null || true)
+            case "$st" in
+              ahead|identical) newest=$t; break ;;
+            esac
+          done < <(awk '{print $2}' <<<"$names" | sort -Vru | sed -n 1,5p)
+          echo "this commit carries: ${tag:-no v* tag}; newest tag at or below it: ${newest:-none}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "newest=$newest" >> "$GITHUB_OUTPUT"
+
+      # The whole decision, and why it lives here, is in the header comment and
+      # in the script's own. --no-gpg-verify on its pull is about the pull,
+      # not the republish: the objects it fetches were built and signed by
+      # this workflow on an earlier run, re-verifying them buys nothing, and a
+      # signing-key rotation would otherwise fail this step on old objects it
+      # has no reason to distrust. What is published is signed in the next step.
+      - name: Decide the stable channel
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          NEWEST_TAG: ${{ steps.release.outputs.newest }}
+          FLATPAK_GPG_HOME: ${{ steps.gpg.outputs.gpghome }}
+          FLATPAK_GPG_KEY_ID: ${{ steps.gpg.outputs.signing == 'true' && secrets.FLATPAK_GPG_KEY_ID || '' }}
+        run: bash packaging/flatpak-stable.sh merged
+
+      # Regenerates the summary and appstream branch over the *merged* tree,
+      # so the one that actually gets published describes both
+      # architectures -- each leg's own run of this same command in `build`
+      # only ever saw its own single-arch repo and was for that leg's bundle,
+      # not for what ends up on Pages. `--default-branch=stable` is guarded
+      # on any `stable` ref existing at all, for either architecture, rather
+      # than naming one arch the way `build`'s own per-leg guard does: a
+      # bare `flatpak install` resolves the branch name from this summary and
+      # then resolves the architecture itself from the installing host, so
+      # this guard only has to answer "does a stable channel exist yet",
+      # not "for which architecture". Guarded on the ref existing at all
+      # because a default branch that does not exist breaks every install,
+      # not just new ones. Verified locally against flatpak 1.18.0 / libostree
+      # 2026.2: `build-update-repo --default-branch=X` writes
+      # xa.default-branch into the summary, and `flatpak remote-info` and
+      # `flatpak install` with no branch named both resolved to X.
+      - name: Update the merged repository's summary and appstream branch
+        run: |
+          set -euo pipefail
+          args=(--prune)
+          if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
+            args+=(--gpg-homedir="${{ steps.gpg.outputs.gpghome }}"
+                   --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}")
+          fi
+          # Not `refs | grep -q`: grep -q exits at the first match and can leave
+          # ostree writing into a closed pipe, which pipefail reports as failure.
+          refs=$(ostree --repo=merged refs)
+          if grep -q '/stable$' <<<"$refs"; then
+            args+=(--default-branch=stable)
+          fi
+          flatpak build-update-repo "${args[@]}" merged
+          ostree --repo=merged refs
+
+      # apt.yml owns building this tree -- see the long comment at the top of
+      # that file for why it is a separate workflow and why it stops at a
+      # plain workflow artifact rather than deploying anywhere itself:
+      # GitHub Pages has one deployment for the whole site, this job already
+      # owns it, and a second workflow calling actions/deploy-pages would
+      # replace this run's output rather than add to it.
+      #
+      # Consequence worth knowing rather than being surprised by: this reads
+      # apt.yml's *latest successful run*, not one from this same commit, so
+      # a Pages deploy can carry an apt tree that is up to one push behind
+      # the flatpak repo beside it. The two workflows are independent and
+      # this step does not wait for a fresh one -- waiting would mean this
+      # job blocking on a second workflow_run round trip, which is a much
+      # bigger change to a file this repository has already spent real
+      # debugging time getting right. If that lag ever matters enough to
+      # remove, the fix is apt.yml uploading straight into this job's own
+      # artifact instead of a separate one, which needs the two workflows
+      # merged into one.
+      - name: Find the latest apt repository build
+        id: aptrepo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list --workflow=apt.yml --status=success --limit=1 \
+                      --json databaseId --jq '.[0].databaseId')
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "no successful apt.yml run yet (no signing key, or it has never run); publishing without /apt/"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          fi
+
+      # continue-on-error rather than trusting `found` alone: apt.yml's job
+      # can conclude success while building nothing at all -- its own
+      # "Import the signing key" step exits 0 on a missing secret and every
+      # step after it, including "Upload the repository tree", is simply
+      # skipped rather than failed. A skipped step does not fail a job, so
+      # `gh run list --status=success` above will happily return that run
+      # long before a maintainer ever adds APT_GPG_PRIVATE_KEY, and
+      # download-artifact then has no "cordial-apt-repo" to fetch from it.
+      # That is a hard failure of this step (verified against the action's
+      # documented behaviour for a missing artifact name, not run here since
+      # it needs a real workflow run), and without continue-on-error it
+      # would take the whole Pages publish down -- Flatpak repo included --
+      # over an apt tree that was never expected to exist yet. The `-d
+      # apt-repo` check in "Assemble the Pages tree" below already handles
+      # the resulting empty directory the same way it handles `found=false`.
+      - name: Download the apt repository
+        if: steps.aptrepo.outputs.found == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: cordial-apt-repo
+          path: apt-repo
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.aptrepo.outputs.run_id }}
+
+      # yum.yml and pacman.yml own building these trees, mirroring apt.yml's
+      # own two steps above exactly -- same "latest successful run" lookup,
+      # same continue-on-error for the same reason: both workflows' jobs can
+      # conclude success while building nothing, because every step past
+      # "Import the signing key" is skipped rather than failed when the
+      # matching secret is absent, and a skipped step does not fail a job.
+      - name: Find the latest dnf repository build
+        id: rpmrepo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list --workflow=yum.yml --status=success --limit=1 \
+                      --json databaseId --jq '.[0].databaseId')
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "no successful yum.yml run yet (no signing key, or it has never run); publishing without /rpm/"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download the dnf repository
+        if: steps.rpmrepo.outputs.found == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: cordial-rpm-repo
+          path: rpm-repo
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.rpmrepo.outputs.run_id }}
+
+      - name: Find the latest pacman repository build
+        id: pacmanrepo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          run_id=$(gh run list --workflow=pacman.yml --status=success --limit=1 \
+                      --json databaseId --jq '.[0].databaseId')
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "no successful pacman.yml run yet (no signing key, or it has never run); publishing without /arch/"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download the pacman repository
+        if: steps.pacmanrepo.outputs.found == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: cordial-pacman-repo
+          path: pacman-repo
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.pacmanrepo.outputs.run_id }}
+
+      - name: Assemble the Pages tree
+        run: |
+          set -euo pipefail
+          mkdir -p pages
+          # The website, which lives in site/ and belongs to whoever writes it.
+          # Copied if it is there and skipped without complaint if it is not, so
+          # that this workflow and the site can land in either order.
+          if [ -d site ] && [ -n "$(ls -A site 2>/dev/null)" ]; then
+            cp -r site/. pages/
+          else
+            echo "site/ is absent or empty; publishing the remote without a landing page"
+          fi
+          # The page's icons, copied from the ones the package and the README
+          # already use rather than duplicated into site/. There is one drawing
+          # of each and this is what keeps it that way: a second copy under
+          # site/ would be the one that goes stale, and nobody diffs an SVG.
+          #
+          # Two files because they are two different pictures. The square one
+          # is the application icon, which is what a browser tab wants; the
+          # 680x480 one is the banner at the top of the README, which is what
+          # the page shows at size. Naming them by role here rather than by
+          # app-id means the rename that happened today does not reach into the
+          # HTML as well.
+          cp "packaging/icons/hicolor/scalable/apps/$APP_ID.svg" pages/favicon.svg
+          #
+          # **The source path is the banner's real name, and getting that wrong
+          # broke every Flatpak run for a day.** The commit that renamed these
+          # renamed the *destinations* here by role, exactly so a future rename
+          # would not reach the HTML -- and then left the source pointing at
+          # `packaging/icons/$APP_ID.svg`, which is the file it had just moved to
+          # `packaging/banner.svg`. The step failed with `cp: cannot stat` and
+          # took the whole Pages deploy with it. Nothing else references the
+          # banner but the README, so nothing else caught it.
+          cp packaging/banner.svg pages/cordial.svg
+          mv merged pages/repo
+
+          # The apt repository, downloaded above from apt.yml's latest green
+          # run. Absent until a maintainer adds APT_GPG_PRIVATE_KEY /
+          # APT_GPG_KEY_ID -- see docs/design/apt-repository.md -- at which
+          # point apt.yml starts producing one and this step starts finding
+          # it, with no change needed here.
+          if [ -d apt-repo ] && [ -n "$(ls -A apt-repo 2>/dev/null)" ]; then
+            mv apt-repo pages/apt
+          else
+            echo "no apt repository artifact available; publishing without /apt/"
+          fi
+
+          # The dnf repository, downloaded above from yum.yml's latest green
+          # run. Absent until a maintainer adds RPM_GPG_PRIVATE_KEY /
+          # RPM_GPG_KEY_ID -- see docs/design/rpm-repository.md -- at which
+          # point yum.yml starts producing one and this step starts finding
+          # it, with no change needed here. packaging/cordial.repo is a
+          # complete, static file rather than one this step appends a key
+          # line to the way it does for cordial.flatpakrepo below: its
+          # gpgkey= is a URL, not an embedded key blob, so the file is
+          # correct whether or not anything is at that URL yet -- it just
+          # 404s honestly until yum.yml has actually signed something.
+          if [ -d rpm-repo ] && [ -n "$(ls -A rpm-repo 2>/dev/null)" ]; then
+            mv rpm-repo pages/rpm
+          else
+            echo "no dnf repository artifact available; publishing without /rpm/"
+          fi
+          cp packaging/cordial.repo pages/cordial.repo
+
+          # The pacman repository, downloaded above from pacman.yml's latest
+          # green run. Same absent-until-secret shape as /rpm/ above -- see
+          # docs/design/pacman-repository.md.
+          #
+          # A pacman repository with a file over Pages' 100 MB limit is left
+          # out rather than allowed to fail this job: that is what stopped
+          # every Flatpak update from 2026-09-28, over a package nobody
+          # installing the Flatpak needs.
+          if [ -d pacman-repo ] && [ -n "$(find pacman-repo -type f -size +99M)" ]; then
+            echo "::warning::pacman repository has files over 100 MB; publishing without /arch/"
+            find pacman-repo -type f -size +99M
+            rm -rf pacman-repo
+          fi
+          if [ -d pacman-repo ] && [ -n "$(ls -A pacman-repo 2>/dev/null)" ]; then
+            mv pacman-repo pages/arch
+          else
+            echo "no pacman repository artifact available; publishing without /arch/"
+          fi
+
+          # Belt and braces. deploy-pages serves the artifact verbatim and does
+          # not run Jekyll, but Jekyll skips paths beginning with _ or . and an
+          # OSTree repository is not worth betting on that staying true.
+          touch pages/.nojekyll
+
+          cp packaging/cordial.flatpakrepo pages/cordial.flatpakrepo
+          if [ "${{ steps.gpg.outputs.signing }}" = "true" ]; then
+            gpg --homedir "${{ steps.gpg.outputs.gpghome }}" \
+                --export "${{ secrets.FLATPAK_GPG_KEY_ID }}" > pages/cordial.gpg
+            printf 'GPGKey=%s\n' "$(base64 -w0 < pages/cordial.gpg)" \
+                >> pages/cordial.flatpakrepo
+          else
+            # Nothing is appended, and that is not an oversight.
+            #
+            # This used to write `GPGKey=` with an empty value, on the recorded
+            # belief that an empty key is how a .flatpakrepo states "unsigned"
+            # in a form flatpak parses, where omitting it says the same thing by
+            # accident. That belief was wrong, and it was wrong in the way that
+            # costs most: the file looked more careful and did not work.
+            #
+            # Measured against the deployed remote with flatpak 1.18.0:
+            #
+            #   GPGKey=      -> error: Invalid gpg key      (remote-add fails)
+            #   omitted      -> accepted; gpg-verify=false,
+            #                   gpg-verify-summary=false, and
+            #                   app/io.github.luohoa97.Cordial/x86_64/master lists
+            #
+            # So an unsigned remote is expressed by the absence of the line, and
+            # the README is where "this remote is unsigned" gets said to a human
+            # in a form a human reads.
+            echo "no signing key; the .flatpakrepo is published without a GPGKey line"
+          fi
+
+      - name: Report the payload size
+        run: |
+          set -euo pipefail
+          du -sh pages pages/repo
+          echo "largest objects:"
+          # sed rather than head: head exits after five lines, sort is then
+          # killed by SIGPIPE ("sort: fflush failed: Broken pipe"), and under
+          # pipefail that failed run 36518320870's merge job over a diagnostic.
+          find pages/repo -type f -printf '%s\t%p\n' | sort -rn | sed -n 1,5p
+          bytes=$(du -sb pages | cut -f1)
+          big=$(find pages -type f -size +99M | sed -n 1,5p)
+          if [ -n "$big" ]; then
+            echo "::error::files over GitHub Pages' 100 MB per-file limit:"
+            echo "$big"
+            exit 1
+          fi
+          # GitHub publishes 1 GB as the Pages site limit. Fail here rather than
+          # at deploy, where the message is much less obvious.
+          if [ "$bytes" -gt 966367641 ]; then
+            echo "::error::pages tree is $(du -sh pages | cut -f1), over the 1 GB Pages limit"
+            exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+
+      # Two gates on purpose. The ref gate keeps pull requests from publishing;
+      # the variable gate keeps *anything* from publishing until someone sets it,
+      # which is the point at which they have also turned Pages on.
+      # Tags are deliberately NOT listed, and that is a correction rather than a
+      # restriction. This condition used to invite them, and every tagged release
+      # then failed here after `build` had already succeeded: the `github-pages`
+      # environment carries a deployment branch policy naming `main` and nothing
+      # else, so a `v*` ref is refused by the environment no matter what this
+      # file says. v0.6.0 is the run that showed it -- build green, deploy red,
+      # for a reason invisible in the workflow.
+      #
+      # Publishing from `main` is not a workaround: a release commit is on main
+      # too, so tagging still publishes, one run earlier. If tagged deploys are
+      # ever wanted, the fix is a `v*` tag policy on the environment in repository
+      # settings, and this condition should only start naming tags once that
+      # exists -- a workflow that promises what the environment forbids is how
+      # this stayed hidden.
+      #
+      # This was the separate `deploy` job; see `concurrency:` at the top of
+      # this one for why it is a step now.
+      - id: deployment
+        if: vars.PUBLISH_PAGES == 'true' && github.ref == 'refs/heads/main'
+        uses: actions/deploy-pages@v4
+
+  publish:
+    name: Attach to the release
+    # Only needs the bundle, which "Upload the bundle as a workflow artefact"
+    # above produces on every run, tag or not -- this job's own `if:` below is
+    # what keeps it from running (and failing on a release that should not
+    # exist yet) off a tag. It deliberately does not need `deploy`: the Pages
+    # publish and the release attachment share no resource, the way the long
+    # comment at the top of this file already argues for the two native and
+    # Flatpak workflows as a whole.
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    # A reusable workflow does not inherit the permissions of the workflow
+    # that calls it -- see the `permissions:` block near the top of this file
+    # for why `contents: write` no longer lives there now that this is the
+    # only job that needs it.
+    permissions:
+      contents: write
+      id-token: write
+      # `attach-to-release.yml` dispatches the Discord announcement when it
+      # is the job that created the release, and a reusable workflow cannot
+      # hold a permission its caller did not grant.
+      actions: write
+    uses: ./.github/workflows/attach-to-release.yml
+    with:
+      # cordial-flatpak-bundle-* rather than the exact name: `build` is now
+      # matrixed over x86_64 and aarch64 and uploads one bundle artifact per
+      # arch, the same reason release.yml's own artifact_pattern is a glob.
+      artifact_pattern: cordial-flatpak-bundle-*
+      file_globs: '*.flatpak'
+      expected_count: 2

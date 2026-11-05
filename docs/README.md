@@ -26,6 +26,7 @@ order a newcomer would want it.
 | [`HANDOVER.md`](HANDOVER.md) | Written for whoever takes this on: every open thread, which claims are `INFERRED`, and the traps |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | What changed between releases, retractions included. [Releases](https://github.com/luohoa97/cordial/releases) |
 | [`findings.md`](findings.md) | Bootstrap analysis: the architecture verdict and what is unknown |
+| [`analysis/windows-runtime-feasibility.md`](analysis/windows-runtime-feasibility.md) | Why the existing ELF/glibc runtime is not a direct Windows port, and the go/no-go criteria |
 | [`framework-api-inventory.md`](framework-api-inventory.md) | The framework backlog, enumerated from the shipping APK |
 | [`traces/`](traces) | A capture of the same APK on real Android — the ground truth this project checks itself against |
 

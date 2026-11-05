@@ -1,4 +1,5 @@
-# Build the Flatpak and publish it as an OSTree remote on GitHub Pages, so that
+# Build the Flatpak and, when explicitly requested, publish it as an OSTree
+# remote on GitHub Pages, so that
 #
 #     flatpak remote-add --if-not-exists cordial \
 #         https://luohoa97.github.io/cordial/cordial.flatpakrepo
@@ -34,11 +35,11 @@
 # A browser hitting the root has to get a web page, which is why the repository
 # is under /repo/ rather than at the root.
 #
-# Nothing deploys until the repository variable PUBLISH_PAGES is set to "true"
-# and Pages is switched to "GitHub Actions" in the repository settings. Until
-# then this builds and uploads an artifact and stops, which is deliberate: a
-# workflow that starts publishing a public remote the moment it lands is not a
-# thing to spring on anyone.
+# This workflow is manual-only while Windows compatibility work is in progress:
+# pushes and release tags no longer build or ship a Flatpak. A manual run builds
+# artifacts but does not publish by default. Publishing requires explicitly
+# setting the `publish` input to true; the Pages deployment additionally
+# requires PUBLISH_PAGES=true and Pages to use GitHub Actions.
 #
 # Two branches live in that repository, not one:
 #
@@ -91,15 +92,13 @@
 name: Flatpak
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
-    paths:
-      - 'packaging/**'
-      - '.github/workflows/flatpak.yml'
-      - 'Cargo.lock'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Explicitly publish the Flatpak bundle and Pages tree
+        required: false
+        type: boolean
+        default: false
 
 # `actions: read` is for "Fetch the apt repository" in the build job below,
 # which reads apt.yml's artifacts from a *different* workflow run than this
@@ -596,7 +595,7 @@ jobs:
     # it, was not documented anywhere that was read; the dispatch run from a
     # branch is what shows it (see the commit).
     environment:
-      name: ${{ (github.ref == 'refs/heads/main' && vars.PUBLISH_PAGES == 'true') && 'github-pages' || '' }}
+      name: ${{ (inputs.publish && github.ref == 'refs/heads/main' && vars.PUBLISH_PAGES == 'true') && 'github-pages' || '' }}
       url: ${{ steps.deployment.outputs.page_url }}
     # A job-level block replaces the workflow's, so the two it needs from
     # there are repeated: contents for checkout, actions for the apt, dnf and
@@ -1087,7 +1086,7 @@ jobs:
       # This was the separate `deploy` job; see `concurrency:` at the top of
       # this one for why it is a step now.
       - id: deployment
-        if: vars.PUBLISH_PAGES == 'true' && github.ref == 'refs/heads/main'
+        if: inputs.publish && vars.PUBLISH_PAGES == 'true' && github.ref == 'refs/heads/main'
         uses: actions/deploy-pages@v4
 
   publish:
@@ -1100,7 +1099,7 @@ jobs:
     # comment at the top of this file already argues for the two native and
     # Flatpak workflows as a whole.
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: inputs.publish && startsWith(github.ref, 'refs/tags/v')
     # A reusable workflow does not inherit the permissions of the workflow
     # that calls it -- see the `permissions:` block near the top of this file
     # for why `contents: write` no longer lives there now that this is the
